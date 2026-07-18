@@ -118,6 +118,18 @@ mod tests {
     }
 
     #[test]
+    fn rgba_for_matches_ramp_at_the_exact_endpoints() {
+        // Only t=0.0 and t=1.0 are guaranteed to land on the identical
+        // bucket rgba_for's quantization (truncating cast, 256 buckets)
+        // would produce from ramp's continuous function directly -- 0*255
+        // and 1*255 are both exact integers, but e.g. 0.5*255=127.5
+        // truncates to a neighboring bucket, off by a channel or two from
+        // ramp(0.5) itself. Don't assert exact equality at interior points.
+        assert_eq!(rgba_for(0.0), ramp(0.0));
+        assert_eq!(rgba_for(MAX_CELL_DENSITY), ramp(1.0));
+    }
+
+    #[test]
     fn palette_table_is_fully_populated() {
         // No leftover [0,0,0,0] gaps from an off-by-one in build_palette:
         // alpha should climb monotonically across the whole table, which

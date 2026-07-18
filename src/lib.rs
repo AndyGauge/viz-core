@@ -458,6 +458,12 @@ mod tests {
         let grid = cloud.compute_density_grid(60_000.0, 0b10, &bbox, 10.0, 4.0);
 
         assert_eq!(grid.cells.len(), grid.cols * grid.rows);
+        // A 10-degree-tall bbox at zoom 10 should be many rows, not the
+        // degenerate 1 that a sign error in height_px's north/south
+        // subtraction would silently clamp down to (float->usize casts
+        // saturate negative values to 0, then `.max(1)` masks it further --
+        // see compute_grid's own comment on this exact footgun).
+        assert!(grid.rows > 10, "rows = {}", grid.rows);
 
         // Sensor 1's exact reading at ts=60_000 (an exact snap, not an
         // interpolated blend -- see snaps_exactly_onto_a_real_reading).

@@ -11,6 +11,11 @@ wasm-bindgen = "=0.2.126"
 js-sys = "0.3"
 geo-types = "0.7"
 
+# CanvasRenderingContext2d/HtmlCanvasElement/ImageData only, for
+# paint_heatmap. Unlike geo below, this is genuinely small -- DOM
+# bindings are extern declarations, not bundled algorithm code -- so it
+# only grows the shipped wasm from ~43KB to ~48KB (see the geo comment's
+# history below for where "43KB" itself came from).
 [dependencies.web-sys]
 version = "0.3"
 features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"]
@@ -21,16 +26,18 @@ features = ["CanvasRenderingContext2d", "HtmlCanvasElement", "ImageData"]
 # parallelism libraries (i_overlay, spade, earcut, rayon) this crate has no
 # use for.
 #
-# Note on size, isolation-tested while adding this chapter's projection/KDE
-# code: geo-types itself is nearly free (just num-traits/libm) -- it is NOT
-# what grows the wasm. The *raw rustc* wasm32 output did jump from ~27KB to
-# ~470KB, but that's from wasm32-unknown-unknown's software (libm-crate)
-# implementation of the sin/ln/sinh/atan/exp/powf calls mercator.rs and
-# density.rs now make (no hardware/OS libm on this target) -- inherent to
-# doing Web Mercator + Gaussian KDE at all, not a dependency choice. And
-# it's not the number that ships: wasm-bindgen's own dead-code elimination
-# brings the actual served public/wasm/viz_core_bg.wasm down to ~43KB
-# (up from ~27KB pre-chapter), which is the size that actually matters.
+# Note on size, isolation-tested when this dependency was first added (the
+# density_grid/KDE chapter, before paint_heatmap/web-sys existed):
+# geo-types itself is nearly free (just num-traits/libm) -- it is NOT what
+# grows the wasm. The *raw rustc* wasm32 output did jump from ~27KB to
+# ~470KB at the time, but that's from wasm32-unknown-unknown's software
+# (libm-crate) implementation of the sin/ln/sinh/atan/exp/powf calls
+# mercator.rs and density.rs make (no hardware/OS libm on this target) --
+# inherent to doing Web Mercator + Gaussian KDE at all, not a dependency
+# choice. And it's not the number that ships: wasm-bindgen's own dead-code
+# elimination brought the actual served public/wasm/viz_core_bg.wasm down
+# to ~43KB at that point (up from ~27KB pre-chapter) -- since risen to
+# ~48KB with web-sys added on top, per the comment above.
 [dev-dependencies]
 geo = "0.33"
 
