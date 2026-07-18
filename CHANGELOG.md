@@ -4,6 +4,60 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-07-18
+
+The density grid becomes a picture: intensity mapped to color via a
+precomputed lookup table, painted directly onto a `<canvas>` from Rust —
+no JavaScript touches a pixel.
+
+### Added
+
+- `PointCloud::paint_heatmap` — runs project, KDE, palette, and paint end
+  to end in one call, given a canvas element plus the same filter
+  parameters `snapshot_at`/`density_grid` take. Builds the pixel buffer as
+  `wasm_bindgen::Clamped<&[u8]>` (mapping straight onto a
+  `Uint8ClampedArray`), wraps it in a `web_sys::ImageData`
+  (`new_with_u8_clamped_array_and_sh`), and blits it with
+  `put_image_data`. The canvas's drawing buffer is sized to the density
+  grid's own resolution (one device pixel per KDE cell, not one per
+  screen pixel) — CSS stretches it to the viewport.
+- `palette` module — a precomputed, compile-time (`const fn`) 256-entry
+  RGBA lookup table: transparent blue → cyan → green → yellow → opaque
+  red, alpha rising with intensity. Painting a pixel is an array lookup,
+  not a gradient function evaluated per pixel per frame.
+- `compute_density_grid` — the shared filter/project/splat core
+  `density_grid` and `paint_heatmap` both call, extracted the same way
+  `filtered_snapshot` is already shared between `snapshot_at` and
+  `density_grid`. Returns a pure `density::Grid`, making it natively
+  testable for the first time (unlike `range`/`snapshot_at`/
+  `density_grid`/`paint_heatmap` themselves, which construct real
+  `Float64Array`/`ImageData`/canvas objects and need a JS+DOM runtime
+  `cargo test` doesn't have).
+- Frontend: a third "Heatmap" view mode on the WASM engine, alongside
+  "Show all readings" and "Time playback." Pan, zoom, and scrubbing the
+  time slider each call `paint_heatmap` with whatever changed — one
+  pipeline, three triggers.
+- 11 more unit tests (41 total, up from 30): the palette ramp/
+  quantization math, plus an end-to-end `compute_density_grid` pipeline
+  test asserting a single active sensor's peak cell value and bound.
+
+### Notes
+
+- `web-sys` added as a dependency (`CanvasRenderingContext2d`,
+  `HtmlCanvasElement`, `ImageData` features only). Unlike `geo` last
+  release, this is genuinely small: DOM bindings are extern declarations,
+  not bundled algorithm code, so the shipped `public/wasm/viz_core_bg.wasm`
+  only grows from ~43KB to ~48KB.
+- Deliberately not solved here: a pure pan with no time/sensor change
+  recomputes density that hasn't actually changed. Caching the grid and
+  only reprojecting/repainting against it is a known, flagged
+  optimization — this release ships the correct version first.
+- A plain, absolutely-positioned `<canvas>` doesn't move with Leaflet's
+  own panes during an active drag; the frontend fades it out on
+  `movestart`/`zoomstart` and repaints on `moveend`/`zoomend` rather than
+  tracking the pan in real time. A custom Leaflet layer to fix that is
+  out of scope for this release.
+
 ## [0.2.0] - 2026-07-18
 
 Turns a filtered point set into density numbers on a projected pixel
