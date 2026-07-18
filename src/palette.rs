@@ -5,15 +5,20 @@
 
 const PALETTE_SIZE: usize = 256;
 
-/// Same category of not-yet-calibrated-against-real-data placeholder as
-/// density.rs's VIBRATION_SATURATION_G, but a display/quantization
-/// concern rather than a KDE-modeling one: density.rs decides how heat
-/// spreads, this decides how heat gets colored. compute_grid's cells are
-/// unbounded sums of overlapping kernels (each individually capped at its
-/// point's intensity, max 1.0, per compute_grid's own doc comment) --
-/// this is "about three fully-saturated overlapping readings," the point
-/// past which more stacked density no longer visibly deepens.
-const MAX_CELL_DENSITY: f64 = 3.0;
+/// A display/quantization concern rather than a KDE-modeling one:
+/// density.rs decides how heat spreads, this decides how heat gets
+/// colored. Originally 3.0 (an unvalidated "three overlapping readings"
+/// guess); measured against the real SensorDataGenerator output, a
+/// single point's own intensity (density.rs's `intensity()`, max 1.0)
+/// rarely exceeded ~0.3-0.5 even for a severe reading, at
+/// VIBRATION_SATURATION_G's old value -- meaning a lone hot reading
+/// almost never registered above the ramp's pale, near-transparent low
+/// end, and only overlapping-and-summed readings at low zoom ever looked
+/// visibly hot. 1.0 means a single severe reading (whose intensity now
+/// approaches 1.0 after density.rs's matching recalibration) reaches full
+/// saturation on its own; overlapping readings still sum past this and
+/// saturate faster, which is the correct KDE behavior, not a regression.
+const MAX_CELL_DENSITY: f64 = 1.0;
 
 // Transparent blue -> cyan -> green -> yellow -> opaque red. Alpha rises
 // with intensity so near-zero density is invisible (the map shows
