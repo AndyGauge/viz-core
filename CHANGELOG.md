@@ -33,10 +33,17 @@ no JavaScript touches a pixel.
   `density_grid`/`paint_heatmap` themselves, which construct real
   `Float64Array`/`ImageData`/canvas objects and need a JS+DOM runtime
   `cargo test` doesn't have).
+- `PointCloud::paint_heatmap_labels` — draws each active sensor's raw
+  `vibration_g`/`temp_f` readings as text at its projected position, the
+  actual numbers driving `paint_heatmap`'s color rather than the color
+  itself. A separate canvas on purpose: `paint_heatmap`'s is deliberately
+  sized to the coarse KDE grid resolution and CSS-stretched, which would
+  blur text, so this one is sized to the bbox's full projected pixel
+  resolution instead.
 - Frontend: a third "Heatmap" view mode on the WASM engine, alongside
   "Show all readings" and "Time playback." Pan, zoom, and scrubbing the
-  time slider each call `paint_heatmap` with whatever changed — one
-  pipeline, three triggers.
+  time slider each call `paint_heatmap`/`paint_heatmap_labels` with
+  whatever changed — one pipeline, three triggers.
 - 11 more unit tests (41 total, up from 30): the palette ramp/
   quantization math, plus an end-to-end `compute_density_grid` pipeline
   test asserting a single active sensor's peak cell value and bound.
@@ -48,6 +55,11 @@ no JavaScript touches a pixel.
   release, this is genuinely small: DOM bindings are extern declarations,
   not bundled algorithm code, so the shipped `public/wasm/viz_core_bg.wasm`
   only grows from ~43KB to ~48KB.
+- `paint_heatmap_labels` grows the shipped wasm further, to ~77KB — this
+  is the crate's first use of float-to-string formatting (`format!` for
+  the on-canvas readouts), and `core::fmt`'s float formatting is known to
+  cost real code size on `wasm32-unknown-unknown` (no hardware-assisted
+  path). Not a dependency; inherent to formatting floats at all.
 - Deliberately not solved here: a pure pan with no time/sensor change
   recomputes density that hasn't actually changed. Caching the grid and
   only reprojecting/repainting against it is a known, flagged

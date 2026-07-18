@@ -284,6 +284,73 @@ impl PointCloud {
         ctx.put_image_data(&image_data, 0.0, 0.0)
     }
 
+    /// Draws each active sensor's raw readings as text at its projected
+    /// position -- the numbers actually driving `paint_heatmap`'s color,
+    /// not the color itself. A separate canvas from `paint_heatmap`'s on
+    /// purpose: that canvas is deliberately sized to the KDE grid's own
+    /// (coarse) resolution and CSS-stretched, which would make text blurry;
+    /// this one is sized to the bbox's full projected pixel resolution so
+    /// labels stay crisp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_heatmap_labels(
+        &self,
+        canvas: &HtmlCanvasElement,
+        at_ts: f64,
+        sensor_mask: u32,
+        min_lat: f64,
+        min_lng: f64,
+        max_lat: f64,
+        max_lng: f64,
+        zoom: f64,
+        sensor_names: Vec<String>,
+    ) -> Result<(), JsValue> {
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
+        let readings = self.filtered_snapshot(at_ts, sensor_mask, &bbox);
+
+        let (min, max) = (bbox.min(), bbox.max());
+        let (origin_x, origin_y) = project(min.x, max.y, zoom);
+        let (max_x, _) = project(max.x, max.y, zoom);
+        let (_, max_y) = project(min.x, min.y, zoom);
+        let width_px = max_x - origin_x;
+        let height_px = max_y - origin_y;
+
+        // Resizing clears the canvas's existing content -- no separate
+        // clear_rect needed.
+        canvas.set_width(width_px.round().max(1.0) as u32);
+        canvas.set_height(height_px.round().max(1.0) as u32);
+
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("canvas 2d context unavailable"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        ctx.set_font("12px -apple-system, sans-serif");
+        ctx.set_text_align("center");
+        ctx.set_line_width(3.0);
+        ctx.set_stroke_style_str("#000");
+        ctx.set_fill_style_str("#fff");
+
+        for r in &readings {
+            let (x, y) = project(r.lng, r.lat, zoom);
+            let (x, y) = (x - origin_x, y - origin_y);
+
+            let name = sensor_names
+                .get(r.sensor_idx as usize)
+                .map(String::as_str)
+                .unwrap_or("?");
+            let readout = format!("{:.2}g / {:.0}\u{00b0}F", r.vibration_g, r.temp_f);
+
+            // Stroke behind fill on each line, for legibility over any
+            // map/heatmap color underneath.
+            ctx.stroke_text(name, x, y - 14.0)?;
+            ctx.fill_text(name, x, y - 14.0)?;
+            ctx.stroke_text(&readout, x, y)?;
+            ctx.fill_text(&readout, x, y)?;
+        }
+
+        Ok(())
+    }
+
     /// Shared by `density_grid` and `paint_heatmap`: filters, projects, and
     /// splats -- everything short of flattening to a wire format (the
     /// former) or palette-mapping and painting (the latter).
