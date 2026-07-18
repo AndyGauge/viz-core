@@ -4,12 +4,18 @@
 //! visibly jump as a reading crosses a bin boundary while the customer
 //! scrubs the time slider.
 
-// Placeholder calibration constants -- tune against real farm/highway data
-// ranges before this ships; the unit-test fixture's vibration_g range
-// (0.1-0.4) is not necessarily representative of production magnitudes.
+// Calibrated against the actual SensorDataGenerator output (not the
+// original 0.1-0.4 placeholder guess, which undershot both scenarios):
+// cluster vibration_g ranges 0.0-0.915g (avg 0.037g, mostly near-silent
+// with rare real spikes); highway ranges 0.25-3.058g (avg 0.519g). At
+// VIBRATION_SATURATION_G = 2.0, even highway's worst pothole spikes only
+// reached ~65% of the color ramp and a single reading almost never stood
+// out on its own -- only overlapping, summed readings at low zoom ever
+// looked "hot." 1.0 means a single severe reading (>= 1g, well within
+// both scenarios' real range) now saturates on its own.
 const TEMP_BASELINE_F: f64 = 70.0;
 const TEMP_SPAN_F: f64 = 50.0;
-const VIBRATION_SATURATION_G: f64 = 2.0;
+const VIBRATION_SATURATION_G: f64 = 1.0;
 const TEMP_WEIGHT: f64 = 0.35;
 const VIBRATION_WEIGHT: f64 = 0.65;
 
@@ -215,5 +221,23 @@ mod tests {
         let grid = compute_grid(&[], 40.0, 40.0, 4.0);
         assert_eq!(grid.cols * grid.rows, grid.cells.len());
         assert!(grid.cells.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn intensity_matches_real_generator_output_ranges() {
+        // Calibration guard: pins the VIBRATION_SATURATION_G recalibration
+        // (2.0 -> 1.0) against SensorDataGenerator's actual output ranges,
+        // so a future constant change gets caught here instead of only
+        // being noticed as "the heatmap looks grey" in a browser.
+        // cluster: vibration_g 0.0-0.915 (avg 0.037); a real spike should
+        // clearly outrank the near-silent baseline.
+        assert!(intensity(75.0, 0.037) < 0.15);
+        assert!(intensity(75.0, 0.915) > 0.5);
+        // highway: vibration_g 0.25-3.058 (avg 0.519), refrigerated temps
+        // far from TEMP_BASELINE_F; typical operation should already read
+        // as more than "faint," and a pothole-magnitude spike should be
+        // near full saturation.
+        assert!(intensity(34.0, 0.519) > 0.4);
+        assert!(intensity(34.0, 3.058) > 0.85);
     }
 }
