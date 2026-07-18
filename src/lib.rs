@@ -110,6 +110,26 @@ impl PointCloud {
     /// blended between the two readings bracketing it. This is the time
     /// slider's "video playback" path: scrubbing asks for a single instant,
     /// not the raw once-a-minute cadence, so motion reads as continuous.
+    ///
+    /// Each returned row is `[sensor_idx, lat, lng, temp_f, vibration_g, at_ts]`
+    /// (`ROW_LEN` = 6 floats), flattened into one `Float64Array`.
+    ///
+    /// # Examples
+    ///
+    /// Called from the frontend on every slider tick, with the map's current
+    /// viewport and sensor selection as the filter:
+    ///
+    /// ```js
+    /// const bounds = map.getBounds();
+    /// const rows = cloud.snapshot_at(
+    ///   atTs, sensorMask,
+    ///   bounds.getSouth(), bounds.getWest(), bounds.getNorth(), bounds.getEast(),
+    /// );
+    /// for (let i = 0; i < rows.length; i += 6) {
+    ///   const [sensorIdx, lat, lng, tempF, vibrationG] = rows.slice(i, i + 6);
+    ///   // ...place a marker at [lat, lng]
+    /// }
+    /// ```
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_at(
         &self,
@@ -168,5 +188,59 @@ impl PointCloud {
             lerp(self.temp_f[lo], self.temp_f[hi]),
             lerp(self.vibration_g[lo], self.vibration_g[hi]),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Two sensors, three readings each, one minute apart. Built directly
+    // (bypassing `new`) since `new` takes a JS `Float64Array`, which needs a
+    // JS runtime to construct -- `bracket`/`interpolate` are pure Rust and
+    // don't need one.
+    fn test_cloud() -> PointCloud {
+        PointCloud {
+            sensor_idx: vec![0, 0, 0, 1, 1, 1],
+            lat: vec![10.0, 20.0, 30.0, 40.0, 40.0, 40.0],
+            lng: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            temp_f: vec![60.0, 62.0, 64.0, 70.0, 70.0, 70.0],
+            vibration_g: vec![0.1, 0.2, 0.3, 0.4, 0.4, 0.4],
+            timestamp_ms: vec![0.0, 60_000.0, 120_000.0, 0.0, 60_000.0, 120_000.0],
+            by_sensor: vec![vec![0, 1, 2], vec![3, 4, 5]],
+        }
+    }
+
+    #[test]
+    fn interpolates_halfway_between_two_readings() {
+        let cloud = test_cloud();
+        let (lo, hi) = cloud.bracket(&cloud.by_sensor[0], 30_000.0);
+        let (lat, _lng, temp, _vib) = cloud.interpolate(lo, hi, 30_000.0);
+        assert_eq!(lat, 15.0); // halfway from 10.0 to 20.0
+        assert_eq!(temp, 61.0); // halfway from 60.0 to 62.0
+    }
+
+    #[test]
+    fn clamps_to_the_first_reading_before_the_series_starts() {
+        let cloud = test_cloud();
+        let (lo, hi) = cloud.bracket(&cloud.by_sensor[0], -10_000.0);
+        let (lat, ..) = cloud.interpolate(lo, hi, -10_000.0);
+        assert_eq!(lat, 10.0);
+    }
+
+    #[test]
+    fn clamps_to_the_last_reading_after_the_series_ends() {
+        let cloud = test_cloud();
+        let (lo, hi) = cloud.bracket(&cloud.by_sensor[0], 999_999.0);
+        let (lat, ..) = cloud.interpolate(lo, hi, 999_999.0);
+        assert_eq!(lat, 30.0);
+    }
+
+    #[test]
+    fn snaps_exactly_onto_a_real_reading() {
+        let cloud = test_cloud();
+        let (lo, hi) = cloud.bracket(&cloud.by_sensor[1], 60_000.0);
+        let (lat, ..) = cloud.interpolate(lo, hi, 60_000.0);
+        assert_eq!(lat, 40.0);
     }
 }
