@@ -1,13 +1,17 @@
 mod bbox;
 mod density;
 mod mercator;
+mod palette;
 
 use bbox::{contains_inclusive, make_bbox};
-use density::{compute_grid, intensity, sigma_px, Splat};
+use density::{compute_grid, intensity, sigma_px, Grid, Splat};
 use geo_types::Rect;
 use js_sys::Float64Array;
 use mercator::project;
+use palette::rgba_for;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::{Clamped, JsCast};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
 const ROW_LEN: usize = 6; // sensor_idx, lat, lng, temp_f, vibration_g, timestamp_ms
 
@@ -212,14 +216,161 @@ impl PointCloud {
         cell_size_px: f64,
     ) -> Float64Array {
         let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
+        let grid = self.compute_density_grid(at_ts, sensor_mask, &bbox, zoom, cell_size_px);
+
+        let mut out: Vec<f64> = Vec::with_capacity(2 + grid.cells.len());
+        out.push(grid.cols as f64);
+        out.push(grid.rows as f64);
+        out.extend(grid.cells);
+
+        Float64Array::from(out.as_slice())
+    }
+
+    /// Paints the same kernel-density heatmap `density_grid` computes
+    /// directly onto `canvas`, from Rust, in one call: project, KDE,
+    /// palette, paint end to end. No JavaScript touches a pixel -- the
+    /// pixel buffer is built as a `Clamped<&[u8]>` (mapping straight onto
+    /// a `Uint8ClampedArray`, no separate JS glue), wrapped in an
+    /// `ImageData`, and blitted with `put_image_data`.
+    ///
+    /// The canvas's own drawing buffer is resized (`set_width`/
+    /// `set_height`) to the density grid's `cols`/`rows` -- one device
+    /// pixel per KDE cell, not one per screen pixel. `cell_size_px` is
+    /// already the resolution the Gaussian smoothing is visually
+    /// meaningful at; painting at full viewport resolution would rerun
+    /// KDE far more densely for a blur that's already smoother than that
+    /// per cell. Stretch the small buffer to the viewport's actual size
+    /// with the canvas element's CSS `width`/`height` and let the
+    /// browser's own bilinear upscale do the rest.
+    ///
+    /// Pan, zoom, and scrubbing the time slider each call this same
+    /// entry point with whatever changed (bbox, zoom, or `at_ts`/
+    /// `sensor_mask`) -- one pipeline, three triggers. Deliberately not
+    /// solved here: a pure pan with no time/sensor change recomputes
+    /// density that hasn't actually changed. Caching the density grid
+    /// and only reprojecting/repainting against it is a known, flagged
+    /// optimization; this ships the correct version first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_heatmap(
+        &self,
+        canvas: &HtmlCanvasElement,
+        at_ts: f64,
+        sensor_mask: u32,
+        min_lat: f64,
+        min_lng: f64,
+        max_lat: f64,
+        max_lng: f64,
+        zoom: f64,
+        cell_size_px: f64,
+    ) -> Result<(), JsValue> {
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
+        let grid = self.compute_density_grid(at_ts, sensor_mask, &bbox, zoom, cell_size_px);
+
+        let (cols, rows) = (grid.cols as u32, grid.rows as u32);
+        let mut pixels = vec![0u8; grid.cells.len() * 4];
+        for (i, &density) in grid.cells.iter().enumerate() {
+            pixels[i * 4..i * 4 + 4].copy_from_slice(&rgba_for(density));
+        }
+
+        canvas.set_width(cols);
+        canvas.set_height(rows);
+
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("canvas 2d context unavailable"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        let image_data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&pixels), cols, rows)?;
+        ctx.put_image_data(&image_data, 0.0, 0.0)
+    }
+
+    /// Draws each active sensor's raw readings as text at its projected
+    /// position -- the numbers actually driving `paint_heatmap`'s color,
+    /// not the color itself. A separate canvas from `paint_heatmap`'s on
+    /// purpose: that canvas is deliberately sized to the KDE grid's own
+    /// (coarse) resolution and CSS-stretched, which would make text blurry;
+    /// this one is sized to the bbox's full projected pixel resolution so
+    /// labels stay crisp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_heatmap_labels(
+        &self,
+        canvas: &HtmlCanvasElement,
+        at_ts: f64,
+        sensor_mask: u32,
+        min_lat: f64,
+        min_lng: f64,
+        max_lat: f64,
+        max_lng: f64,
+        zoom: f64,
+        sensor_names: Vec<String>,
+    ) -> Result<(), JsValue> {
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
         let readings = self.filtered_snapshot(at_ts, sensor_mask, &bbox);
+
+        let (min, max) = (bbox.min(), bbox.max());
+        let (origin_x, origin_y) = project(min.x, max.y, zoom);
+        let (max_x, _) = project(max.x, max.y, zoom);
+        let (_, max_y) = project(min.x, min.y, zoom);
+        let width_px = max_x - origin_x;
+        let height_px = max_y - origin_y;
+
+        // Resizing clears the canvas's existing content -- no separate
+        // clear_rect needed.
+        canvas.set_width(width_px.round().max(1.0) as u32);
+        canvas.set_height(height_px.round().max(1.0) as u32);
+
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or_else(|| JsValue::from_str("canvas 2d context unavailable"))?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        ctx.set_font("12px -apple-system, sans-serif");
+        ctx.set_text_align("center");
+        ctx.set_line_width(3.0);
+        ctx.set_stroke_style_str("#000");
+        ctx.set_fill_style_str("#fff");
+
+        for r in &readings {
+            let (x, y) = project(r.lng, r.lat, zoom);
+            let (x, y) = (x - origin_x, y - origin_y);
+
+            let name = sensor_names
+                .get(r.sensor_idx as usize)
+                .map(String::as_str)
+                .unwrap_or("?");
+            let readout = format!("{:.2}g / {:.0}\u{00b0}F", r.vibration_g, r.temp_f);
+
+            // Stroke behind fill on each line, for legibility over any
+            // map/heatmap color underneath.
+            ctx.stroke_text(name, x, y - 14.0)?;
+            ctx.fill_text(name, x, y - 14.0)?;
+            ctx.stroke_text(&readout, x, y)?;
+            ctx.fill_text(&readout, x, y)?;
+        }
+
+        Ok(())
+    }
+
+    /// Shared by `density_grid` and `paint_heatmap`: filters, projects, and
+    /// splats -- everything short of flattening to a wire format (the
+    /// former) or palette-mapping and painting (the latter).
+    fn compute_density_grid(
+        &self,
+        at_ts: f64,
+        sensor_mask: u32,
+        bbox: &Rect<f64>,
+        zoom: f64,
+        cell_size_px: f64,
+    ) -> Grid {
+        let readings = self.filtered_snapshot(at_ts, sensor_mask, bbox);
 
         // Grid-local pixel origin: the viewport's top-left corner (west,
         // north) projected at the requested zoom. x depends only on lng,
         // y only on lat, so the two corners below suffice.
-        let (origin_x, origin_y) = project(min_lng, max_lat, zoom);
-        let (max_x, _) = project(max_lng, max_lat, zoom);
-        let (_, max_y) = project(min_lng, min_lat, zoom);
+        let (min, max) = (bbox.min(), bbox.max());
+        let (origin_x, origin_y) = project(min.x, max.y, zoom);
+        let (max_x, _) = project(max.x, max.y, zoom);
+        let (_, max_y) = project(min.x, min.y, zoom);
         let width_px = max_x - origin_x;
         let height_px = max_y - origin_y;
 
@@ -236,18 +387,11 @@ impl PointCloud {
             })
             .collect();
 
-        let grid = compute_grid(&splats, width_px, height_px, cell_size_px);
-
-        let mut out: Vec<f64> = Vec::with_capacity(2 + grid.cells.len());
-        out.push(grid.cols as f64);
-        out.push(grid.rows as f64);
-        out.extend(grid.cells);
-
-        Float64Array::from(out.as_slice())
+        compute_grid(&splats, width_px, height_px, cell_size_px)
     }
 
     /// One interpolated reading per active sensor at `at_ts`, bbox-filtered.
-    /// Shared by `snapshot_at` and `density_grid`.
+    /// Shared by `snapshot_at` and `compute_density_grid`.
     fn filtered_snapshot(&self, at_ts: f64, sensor_mask: u32, bbox: &Rect<f64>) -> Vec<SensorReading> {
         let mut out = Vec::new();
 
@@ -374,10 +518,54 @@ mod tests {
         assert_eq!(readings[0].sensor_idx, 0);
     }
 
-    // Note: snapshot_at/range/density_grid themselves aren't natively unit
-    // tested (same as before this change) -- they construct a real
-    // js_sys::Float64Array, which needs an actual JS runtime. Their logic
-    // is covered indirectly: filtered_snapshot (above) plus mercator's and
-    // density's own pure-Rust tests cover every piece density_grid
-    // assembles.
+    #[test]
+    fn compute_density_grid_peaks_near_the_only_active_sensor() {
+        let cloud = test_cloud();
+        let bbox = make_bbox(35.0, -1.0, 45.0, 1.0); // covers sensor 1 (lat 40, lng 0) only
+        let grid = cloud.compute_density_grid(60_000.0, 0b10, &bbox, 10.0, 4.0);
+
+        assert_eq!(grid.cells.len(), grid.cols * grid.rows);
+        // A 10-degree-tall bbox at zoom 10 should be many rows, not the
+        // degenerate 1 that a sign error in height_px's north/south
+        // subtraction would silently clamp down to (float->usize casts
+        // saturate negative values to 0, then `.max(1)` masks it further --
+        // see compute_grid's own comment on this exact footgun).
+        assert!(grid.rows > 10, "rows = {}", grid.rows);
+
+        // Sensor 1's exact reading at ts=60_000 (an exact snap, not an
+        // interpolated blend -- see snaps_exactly_onto_a_real_reading).
+        let expected_peak = intensity(70.0, 0.4);
+        let actual_peak = grid.cells.iter().cloned().fold(0.0_f64, f64::max);
+
+        assert!(actual_peak > 0.0);
+        // A single point's own contribution never exceeds its intensity
+        // (compute_grid's unnormalized-Gaussian invariant, tested directly
+        // in density.rs).
+        assert!(actual_peak <= expected_peak + 1e-9);
+        // The nearest cell center should land close to the true peak, not
+        // smeared away by an unlucky grid alignment.
+        assert!(actual_peak > expected_peak * 0.9);
+    }
+
+    #[test]
+    fn compute_density_grid_is_empty_when_no_sensor_is_selected() {
+        let cloud = test_cloud();
+        // A realistic, screen-scale bbox -- not the whole globe: at
+        // zoom=10 a (-90,-180,90,180) bbox works out to a ~65536x65536
+        // cell grid (~4.3 billion f64s), since compute_grid allocates
+        // cols*rows regardless of splat count. No real caller passes a
+        // global viewport at this zoom; keep the test's bbox matched to
+        // what the frontend would actually request.
+        let bbox = make_bbox(35.0, -1.0, 45.0, 1.0);
+        let grid = cloud.compute_density_grid(60_000.0, 0, &bbox, 10.0, 4.0);
+        assert!(grid.cells.iter().all(|&v| v == 0.0));
+    }
+
+    // Note: snapshot_at/range/density_grid/paint_heatmap themselves aren't
+    // natively unit tested -- they construct a real js_sys::Float64Array
+    // or take a real web_sys::HtmlCanvasElement, either of which needs a
+    // JS/DOM runtime `cargo test` doesn't have. Their logic is covered
+    // indirectly: filtered_snapshot and compute_density_grid (above) plus
+    // mercator's, density's, and palette's own pure-Rust tests cover every
+    // piece those methods assemble.
 }
