@@ -1,4 +1,12 @@
+mod bbox;
+mod density;
+mod mercator;
+
+use bbox::{contains_inclusive, make_bbox};
+use density::{compute_grid, intensity, sigma_px, Splat};
+use geo_types::Rect;
 use js_sys::Float64Array;
+use mercator::project;
 use wasm_bindgen::prelude::*;
 
 const ROW_LEN: usize = 6; // sensor_idx, lat, lng, temp_f, vibration_g, timestamp_ms
@@ -19,6 +27,18 @@ pub struct PointCloud {
     // instant in time can be located with a binary search per sensor
     // instead of a linear scan of the whole cloud.
     by_sensor: Vec<Vec<u32>>,
+}
+
+/// One interpolated reading for a single sensor at some instant, already
+/// bbox-filtered. Shared by `snapshot_at` (flattens to its wire format) and
+/// `density_grid` (projects + splats instead) so the by_sensor/bracket/
+/// interpolate walk isn't duplicated a third time.
+struct SensorReading {
+    sensor_idx: u32,
+    lat: f64,
+    lng: f64,
+    temp_f: f64,
+    vibration_g: f64,
 }
 
 #[wasm_bindgen]
@@ -81,6 +101,7 @@ impl PointCloud {
         max_lat: f64,
         max_lng: f64,
     ) -> Float64Array {
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
         let mut out: Vec<f64> = Vec::new();
 
         for i in 0..self.lat.len() {
@@ -92,7 +113,7 @@ impl PointCloud {
                 continue;
             }
             let (lat, lng) = (self.lat[i], self.lng[i]);
-            if lat < min_lat || lat > max_lat || lng < min_lng || lng > max_lng {
+            if !contains_inclusive(&bbox, lat, lng) {
                 continue;
             }
             out.push(self.sensor_idx[i] as f64);
@@ -140,7 +161,95 @@ impl PointCloud {
         max_lat: f64,
         max_lng: f64,
     ) -> Float64Array {
-        let mut out: Vec<f64> = Vec::new();
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
+        let readings = self.filtered_snapshot(at_ts, sensor_mask, &bbox);
+
+        let mut out: Vec<f64> = Vec::with_capacity(readings.len() * ROW_LEN);
+        for r in &readings {
+            out.push(r.sensor_idx as f64);
+            out.push(r.lat);
+            out.push(r.lng);
+            out.push(r.temp_f);
+            out.push(r.vibration_g);
+            out.push(at_ts);
+        }
+
+        Float64Array::from(out.as_slice())
+    }
+
+    /// A kernel-density heatmap grid over the viewport at instant `at_ts`:
+    /// each active sensor's interpolated reading is projected into pixel
+    /// space (Web Mercator, at the given `zoom`) and contributes a smooth
+    /// Gaussian kernel to its neighboring cells, sized by its own
+    /// `vibration_g` magnitude, blended with `temp_f` into one intensity
+    /// value. This turns the filtered point set into density numbers on a
+    /// projected plane -- it does not decide colors or paint any pixels;
+    /// that's a later stage.
+    ///
+    /// The returned `Float64Array` is `[cols, rows, cell(0,0), cell(0,1),
+    /// ..., cell(rows-1, cols-1)]`: a 2-value header giving the grid's
+    /// dimensions (so the caller doesn't have to re-derive them from the
+    /// viewport/zoom/cell size itself), followed by `cols * rows` row-major
+    /// density values. Grid cells are `cell_size_px` pixels square.
+    ///
+    /// Known limitation: a reading just outside the requested viewport is
+    /// dropped before projection, even though a high-vibration reading's
+    /// kernel could otherwise bleed a little heat into the grid's visible
+    /// edge cells. This matches `range`/`snapshot_at`'s existing hard cutoff
+    /// at the viewport boundary today, so it's not a regression -- just
+    /// known edge softness, fixable later by padding the *selection* bbox
+    /// without changing this grid's dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn density_grid(
+        &self,
+        at_ts: f64,
+        sensor_mask: u32,
+        min_lat: f64,
+        min_lng: f64,
+        max_lat: f64,
+        max_lng: f64,
+        zoom: f64,
+        cell_size_px: f64,
+    ) -> Float64Array {
+        let bbox = make_bbox(min_lat, min_lng, max_lat, max_lng);
+        let readings = self.filtered_snapshot(at_ts, sensor_mask, &bbox);
+
+        // Grid-local pixel origin: the viewport's top-left corner (west,
+        // north) projected at the requested zoom. x depends only on lng,
+        // y only on lat, so the two corners below suffice.
+        let (origin_x, origin_y) = project(min_lng, max_lat, zoom);
+        let (max_x, _) = project(max_lng, max_lat, zoom);
+        let (_, max_y) = project(min_lng, min_lat, zoom);
+        let width_px = max_x - origin_x;
+        let height_px = max_y - origin_y;
+
+        let splats: Vec<Splat> = readings
+            .iter()
+            .map(|r| {
+                let (x, y) = project(r.lng, r.lat, zoom);
+                Splat {
+                    x: x - origin_x,
+                    y: y - origin_y,
+                    intensity: intensity(r.temp_f, r.vibration_g),
+                    sigma_px: sigma_px(r.vibration_g),
+                }
+            })
+            .collect();
+
+        let grid = compute_grid(&splats, width_px, height_px, cell_size_px);
+
+        let mut out: Vec<f64> = Vec::with_capacity(2 + grid.cells.len());
+        out.push(grid.cols as f64);
+        out.push(grid.rows as f64);
+        out.extend(grid.cells);
+
+        Float64Array::from(out.as_slice())
+    }
+
+    /// One interpolated reading per active sensor at `at_ts`, bbox-filtered.
+    /// Shared by `snapshot_at` and `density_grid`.
+    fn filtered_snapshot(&self, at_ts: f64, sensor_mask: u32, bbox: &Rect<f64>) -> Vec<SensorReading> {
+        let mut out = Vec::new();
 
         for (sensor, rows) in self.by_sensor.iter().enumerate() {
             if rows.is_empty() || sensor_mask & (1u32 << sensor) == 0 {
@@ -148,21 +257,22 @@ impl PointCloud {
             }
 
             let (lo, hi) = self.bracket(rows, at_ts);
-            let (lat, lng, temp, vib) = self.interpolate(lo, hi, at_ts);
+            let (lat, lng, temp_f, vibration_g) = self.interpolate(lo, hi, at_ts);
 
-            if lat < min_lat || lat > max_lat || lng < min_lng || lng > max_lng {
+            if !contains_inclusive(bbox, lat, lng) {
                 continue;
             }
 
-            out.push(sensor as f64);
-            out.push(lat);
-            out.push(lng);
-            out.push(temp);
-            out.push(vib);
-            out.push(at_ts);
+            out.push(SensorReading {
+                sensor_idx: sensor as u32,
+                lat,
+                lng,
+                temp_f,
+                vibration_g,
+            });
         }
 
-        Float64Array::from(out.as_slice())
+        out
     }
 
     fn bracket(&self, rows: &[u32], at_ts: f64) -> (u32, u32) {
@@ -243,4 +353,31 @@ mod tests {
         let (lat, ..) = cloud.interpolate(lo, hi, 60_000.0);
         assert_eq!(lat, 40.0);
     }
+
+    #[test]
+    fn filtered_snapshot_drops_sensors_outside_the_bbox() {
+        let cloud = test_cloud();
+        // sensor 0 sits at lat 10-30, sensor 1 at lat 40; restrict to a
+        // bbox that only covers sensor 0's range.
+        let bbox = make_bbox(0.0, -1.0, 35.0, 1.0);
+        let readings = cloud.filtered_snapshot(60_000.0, 0b11, &bbox);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].sensor_idx, 0);
+    }
+
+    #[test]
+    fn filtered_snapshot_respects_the_sensor_mask() {
+        let cloud = test_cloud();
+        let bbox = make_bbox(-90.0, -180.0, 90.0, 180.0);
+        let readings = cloud.filtered_snapshot(60_000.0, 0b01, &bbox); // sensor 0 only
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].sensor_idx, 0);
+    }
+
+    // Note: snapshot_at/range/density_grid themselves aren't natively unit
+    // tested (same as before this change) -- they construct a real
+    // js_sys::Float64Array, which needs an actual JS runtime. Their logic
+    // is covered indirectly: filtered_snapshot (above) plus mercator's and
+    // density's own pure-Rust tests cover every piece density_grid
+    // assembles.
 }
